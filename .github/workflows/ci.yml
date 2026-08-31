@@ -1,0 +1,74 @@
+# ci.yml - dsh-mobile-remote release gate
+# Runs on every push / pull request (free on public repos).
+# Three independent checks; any red = do not release:
+#   1. PSScriptAnalyzer - PowerShell syntax / static analysis
+#   2. ASCII - scripts/*.ps1 must stay pure ASCII (GBK parse crash pitfall)
+#   3. Leak audit - no personal data shapes may appear anywhere in the repo
+#      (generic shape regexes only - deliberately NO real values in this file,
+#       so the audit never matches itself and no secrets live in the repo)
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  psscriptanalyzer:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+      - name: Analyze scripts
+        shell: pwsh
+        run: |
+          $issues = Invoke-ScriptAnalyzer -Path scripts -Recurse -Severity Error
+          if ($issues) {
+            $issues | Format-Table -AutoSize
+            Write-Host "::error::PSScriptAnalyzer found $($issues.Count) Error-level issue(s)"
+            exit 1
+          }
+          Write-Host 'PSScriptAnalyzer: OK (no Error-level issues)'
+
+  ascii:
+    name: Scripts pure ASCII
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan scripts for non-ASCII bytes
+        shell: pwsh
+        run: |
+          $bad = Get-ChildItem scripts -Filter *.ps1 | Where-Object {
+            ([System.IO.File]::ReadAllBytes($_.FullName) | Where-Object { $_ -gt 127 })
+          }
+          if ($bad) {
+            $bad | ForEach-Object { Write-Host "NON-ASCII: $($_.Name)" }
+            Write-Host "::error::scripts contain non-ASCII bytes (GBK parse crash risk)"
+            exit 1
+          }
+          Write-Host 'ASCII check: OK'
+
+  leak-audit:
+    name: Personal-data leak audit
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan repo for personal-data shapes
+        shell: pwsh
+        run: |
+          $patterns = @(
+            '\.tail[0-9a-f]{6,}\.ts\.net',                       # real tailnet hostnames
+            '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}',    # email addresses
+            '[A-Z]:\\Users\\(?!Public|Default|Administrator)'    # absolute user home paths
+          )
+          $hits = Get-ChildItem -Recurse -File | Select-String -Pattern $patterns
+          if ($hits) {
+            $hits | ForEach-Object { Write-Host "LEAK: $($_.Path): $($_.Line.Trim())" }
+            Write-Host "::error::personal-data shapes found; do not release"
+            exit 1
+          }
+          if ((Get-Content LICENSE -Raw) -match '<Your Name>') {
+            Write-Host "::error::LICENSE still contains the <Your Name> placeholder"
+            exit 1
+          }
+          Write-Host 'Leak audit: OK'
